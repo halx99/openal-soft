@@ -1238,6 +1238,18 @@ if(ALSOFT_UTILS)
 endif()
 if(ALSOFT_UTILS OR ALSOFT_EXAMPLES)
     find_package(SndFile)
+    
+    if(SNDFILE_FOUND)
+        find_package(MPG123)
+        find_package(mp3lame)
+        message(STATUS "Linking SndFile dependency libs...")
+        target_link_libraries(SndFile::SndFile 
+            INTERFACE MPG123::libmpg123
+            INTERFACE mp3lame::mp3lame
+            INTERFACE mp3lame::mpghip
+        )
+    endif()
+
     find_package(SDL2)
     if(SDL2_FOUND)
         find_package(FFmpeg COMPONENTS AVFORMAT AVCODEC AVUTIL SWSCALE SWRESAMPLE)
