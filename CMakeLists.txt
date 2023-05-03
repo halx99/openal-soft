@@ -148,6 +148,8 @@ set(CPP_DEFS ) # C pre-processor, not C++
 set(INC_PATHS )
 set(C_FLAGS )
 set(LINKER_FLAGS )
+set(LINKER_FLAGS_DEBUG )
+set(LINKER_FLAGS_RELEASE )
 set(EXTRA_LIBS )
 
 if(WIN32)
@@ -992,6 +994,31 @@ endif()
 
 # Check Windows-only backends
 if(WIN32)
+    
+    if(${CMAKE_SYSTEM_NAME} MATCHES "WindowsStore")
+        # WindowsStore (UWP) Apps only works with xaudio2 backend
+	    # WaveFile could compile and link, but no voice could be hear when play sound
+	    # Other backends can't be compiled because may Win32 APIs doesn't present in WINRT
+	    # APIs
+        option(ALSOFT_BACKEND_XAUDIO2 "Enable Windows XAudio2 backend" ON)
+        option(ALSOFT_REQUIRE_XAUDIO2 "Require Windows Xaudio2 backend" ON)
+        if (ALSOFT_BACKEND_XAUDIO2)
+            set(EXTRA_LIBS runtimeobject ${EXTRA_LIBS})
+            check_include_file(xaudio2.h HAVE_XAUDIO2_H)
+            if(HAVE_XAUDIO2_H)
+                set(HAVE_XAUDIO2 1)
+                set(BACKENDS "${BACKENDS} Xaudio2,")
+                set(ALC_OBJS ${ALC_OBJS} alc/backends/xaudio2.cpp alc/backends/xaudio2.h)
+                set(EXTRA_LIBS Xaudio2 ${EXTRA_LIBS})
+                set_source_files_properties(alc/backends/xaudio2.cpp PROPERTIES COMPILE_FLAGS /ZW)
+                # Add compile and link flags required C++/CX
+                set(C_FLAGS "/Zc:twoPhase-" ${C_FLAGS})
+                set(LINKER_FLAGS_DEBUG "/nodefaultlib:vccorlibd /nodefaultlib:msvcrtd vccorlibd.lib msvcrtd.lib ${LINKER_FLAGS_DEBUG}")
+                set(LINKER_FLAGS_RELEASE "/nodefaultlib:vccorlib /nodefaultlib:msvcrt vccorlib.lib msvcrt.lib ${LINKER_FLAGS_RELEASE}")
+            endif()
+        endif()
+    endif()
+
     # Check MMSystem backend
     option(ALSOFT_BACKEND_WINMM "Enable Windows Multimedia backend" ON)
     option(ALSOFT_REQUIRE_WINMM "Require Windows Multimedia backend" OFF)
@@ -1021,11 +1048,11 @@ if(WIN32)
             set(BACKENDS "${BACKENDS} DirectSound,")
             set(ALC_OBJS ${ALC_OBJS} alc/backends/dsound.cpp alc/backends/dsound.h)
 
-            if(NOT HAVE_DSOUND_H)
-                set(INC_PATHS ${INC_PATHS} ${DSOUND_INCLUDE_DIR})
+                if(NOT HAVE_DSOUND_H)
+                    set(INC_PATHS ${INC_PATHS} ${DSOUND_INCLUDE_DIR})
+                endif()
             endif()
         endif()
-    endif()
 
     # Check for WASAPI backend
     option(ALSOFT_BACKEND_WASAPI "Enable WASAPI backend" ON)
@@ -1386,6 +1413,13 @@ else()
         # the version script will not cause a relink as it should.
         set_property(TARGET ${IMPL_TARGET} APPEND_STRING PROPERTY
             LINK_FLAGS " -Wl,--version-script=${OpenAL_SOURCE_DIR}/libopenal.version")
+    elseif(WIN32)
+        set_target_properties(${IMPL_TARGET} PROPERTIES 
+            LINK_FLAGS_DEBUG "${LINKER_FLAGS_DEBUG}"
+            LINK_FLAGS_RELEASE "${LINKER_FLAGS_RELEASE}"
+            LINK_FLAGS_MINSIZEREL "${LINKER_FLAGS_RELEASE}"
+            LINK_FLAGS_RELWITHDEBINFO "${LINKER_FLAGS_RELEASE}"
+        )
     endif()
 
     if(APPLE AND ALSOFT_OSX_FRAMEWORK)
