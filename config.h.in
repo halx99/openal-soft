@@ -46,6 +46,9 @@
 /* Define if we have the WASAPI backend */
 #cmakedefine HAVE_WASAPI
 
+/* Define if we have the XAUDIO2 backend */
+#cmakedefine HAVE_XAUDIO2
+
 /* Define if we have the DSound backend */
 #cmakedefine HAVE_DSOUND
 

@@ -873,6 +873,7 @@ set(HAVE_SOLARIS    0)
 set(HAVE_SNDIO      0)
 set(HAVE_DSOUND     0)
 set(HAVE_WASAPI     0)
+set(HAVE_XAUDIO2    0)
 set(HAVE_WINMM      0)
 set(HAVE_PORTAUDIO  0)
 set(HAVE_PULSEAUDIO 0)
@@ -1011,7 +1012,25 @@ endif()
 
 # Check Windows-only backends
 if(WIN32)
-    if (NOT ALSOFT_UWP)
+    if (ALSOFT_UWP)
+        # WindowsStore (UWP) Apps only works with xaudio2 backend
+	    # WaveFile could compile and link, but no voice could be hear when play sound
+	    # Other backends can't be compiled because may Win32 APIs doesn't present in WINRT
+	    # APIs
+        option(ALSOFT_BACKEND_XAUDIO2 "Enable Windows XAudio2 backend" ON)
+        option(ALSOFT_REQUIRE_XAUDIO2 "Require Windows Xaudio2 backend" ON)
+        if (ALSOFT_BACKEND_XAUDIO2)
+            set(EXTRA_LIBS runtimeobject ${EXTRA_LIBS})
+            check_include_file(xaudio2.h HAVE_XAUDIO2_H)
+            if(HAVE_XAUDIO2_H)
+                set(HAVE_XAUDIO2 1)
+                set(BACKENDS "${BACKENDS} Xaudio2,")
+                set(ALC_OBJS ${ALC_OBJS} alc/backends/xaudio2.cpp alc/backends/xaudio2.h)
+                set(EXTRA_LIBS Xaudio2 ${EXTRA_LIBS})
+                set_source_files_properties(alc/backends/xaudio2.cpp PROPERTIES COMPILE_FLAGS /ZW)
+            endif()
+        endif()
+    else()
         # Check MMSystem backend
         option(ALSOFT_BACKEND_WINMM "Enable Windows Multimedia backend" ON)
         option(ALSOFT_REQUIRE_WINMM "Require Windows Multimedia backend" OFF)
@@ -1059,12 +1078,16 @@ if(WIN32)
             set(ALC_OBJS  ${ALC_OBJS} alc/backends/wasapi.cpp alc/backends/wasapi.h)
             if(ALSOFT_UWP)
                 set_source_files_properties(alc/backends/wasapi.cpp alc/alconfig.cpp PROPERTIES COMPILE_FLAGS /ZW)
-                    # Add compile and link flags required C++/CX
-                    set(C_FLAGS "/Zc:twoPhase-" ${C_FLAGS})
-                    set(LINKER_FLAGS_DEBUG "/nodefaultlib:vccorlibd /nodefaultlib:msvcrtd vccorlibd.lib msvcrtd.lib ${LINKER_FLAGS_DEBUG}")
-                    set(LINKER_FLAGS_RELEASE "/nodefaultlib:vccorlib /nodefaultlib:msvcrt vccorlib.lib msvcrt.lib ${LINKER_FLAGS_RELEASE}")
             endif()
         endif()
+    endif()
+
+    # Linking for UWP if WASAPI or XAudio2 backend enabled
+    if (ALSOFT_UWP AND (HAVE_WASAPI OR HAVE_XAUDIO2))
+        # Add compile and link flags required C++/CX
+        set(C_FLAGS "/Zc:twoPhase-" ${C_FLAGS})
+        set(LINKER_FLAGS_DEBUG "/nodefaultlib:vccorlibd /nodefaultlib:msvcrtd vccorlibd.lib msvcrtd.lib ${LINKER_FLAGS_DEBUG}")
+        set(LINKER_FLAGS_RELEASE "/nodefaultlib:vccorlib /nodefaultlib:msvcrt vccorlib.lib msvcrt.lib ${LINKER_FLAGS_RELEASE}")
     endif()
 endif()
 if(ALSOFT_REQUIRE_WINMM AND NOT HAVE_WINMM)
