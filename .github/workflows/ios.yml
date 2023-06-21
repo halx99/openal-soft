@@ -27,7 +27,7 @@ jobs:
       run: |
         $cwd = '${{github.workspace}}'
         curl -L 'https://raw.githubusercontent.com/yasio/yasio/dev/cmake/ios.cmake' -o $cwd/cmake/ios.cmake
-        cmake -B build -GXcode "-DCMAKE_TOOLCHAIN_FILE=$cwd/cmake/ios.cmake"
+        cmake -B build -GXcode "-DCMAKE_TOOLCHAIN_FILE=$cwd/cmake/ios.cmake" '-DALSOFT_OSX_FRAMEWORK=ON'
 
     - name: Build
       # Build your program with the given configuration
