@@ -82,7 +82,7 @@ jobs:
             -DALSOFT_EXAMPLES=OFF \
             -DALSOFT_TESTS=OFF \
             -DALSOFT_INSTALL=OFF \
-            \"-DCMAKE_OSX_ARCHITECTURES=arm64\"",
+            \"-DCMAKE_OSX_ARCHITECTURES=x86_64\"",
             build_type: "Release"
           }
         - {
