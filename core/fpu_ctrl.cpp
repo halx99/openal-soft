@@ -1,43 +1,48 @@
 
 #include "config.h"
+#include "config_simd.h"
 
 #include "fpu_ctrl.h"
 
 #ifdef HAVE_INTRIN_H
 #include <intrin.h>
 #endif
-#ifdef HAVE_SSE_INTRINSICS
+#if HAVE_SSE_INTRINSICS
 #include <emmintrin.h>
-#elif defined(HAVE_SSE)
+#elif HAVE_SSE
 #include <xmmintrin.h>
 #endif
 
-#if defined(HAVE_SSE) && !defined(_MM_DENORMALS_ZERO_MASK)
+#if HAVE_SSE && !defined(_MM_DENORMALS_ZERO_MASK)
 /* Some headers seem to be missing these? */
-#define _MM_DENORMALS_ZERO_MASK 0x0040u
-#define _MM_DENORMALS_ZERO_ON 0x0040u
+#define _MM_DENORMALS_ZERO_MASK 0x0040u  /* NOLINT(*-reserved-identifier) */
+#define _MM_DENORMALS_ZERO_ON 0x0040u  /* NOLINT(*-reserved-identifier) */
 #endif
 
+#if !HAVE_SSE_INTRINSICS && HAVE_SSE
 #include "cpu_caps.h"
+#endif
 
 namespace {
 
 #if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))
 [[gnu::target("sse")]]
 #endif
-void disable_denormals(unsigned int *state [[maybe_unused]])
+[[maybe_unused]]
+auto disable_denormals() -> unsigned int
 {
-#if defined(HAVE_SSE_INTRINSICS)
-    *state = _mm_getcsr();
-    unsigned int sseState{*state};
+#if HAVE_SSE_INTRINSICS
+    const auto state = _mm_getcsr();
+    auto sseState = state;
     sseState &= ~(_MM_FLUSH_ZERO_MASK | _MM_DENORMALS_ZERO_MASK);
     sseState |= _MM_FLUSH_ZERO_ON | _MM_DENORMALS_ZERO_ON;
     _mm_setcsr(sseState);
+    return state;
 
-#elif defined(HAVE_SSE)
+#elif HAVE_SSE
 
-    *state = _mm_getcsr();
-    unsigned int sseState{*state};
+    const auto state = _mm_getcsr();
+    auto sseState = state;
     sseState &= ~_MM_FLUSH_ZERO_MASK;
     sseState |= _MM_FLUSH_ZERO_ON;
     if((CPUCapFlags&CPU_CAP_SSE2))
@@ -46,15 +51,21 @@ void disable_denormals(unsigned int *state [[maybe_unused]])
         sseState |= _MM_DENORMALS_ZERO_ON;
     }
     _mm_setcsr(sseState);
+    return state;
+
+#else
+
+    return 0u;
 #endif
 }
 
 #if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))
 [[gnu::target("sse")]]
 #endif
+[[maybe_unused]]
 void reset_fpu(unsigned int state [[maybe_unused]])
 {
-#if defined(HAVE_SSE_INTRINSICS) || defined(HAVE_SSE)
+#if HAVE_SSE_INTRINSICS || HAVE_SSE
     _mm_setcsr(state);
 #endif
 }
@@ -62,29 +73,27 @@ void reset_fpu(unsigned int state [[maybe_unused]])
 } // namespace
 
 
-void FPUCtl::enter() noexcept
+auto FPUCtl::Set() noexcept -> unsigned int
 {
-    if(this->in_mode) return;
+#if HAVE_SSE_INTRINSICS
+    return disable_denormals();
 
-#if defined(HAVE_SSE_INTRINSICS)
-    disable_denormals(&this->sse_state);
-#elif defined(HAVE_SSE)
+#else
+
+#if HAVE_SSE
     if((CPUCapFlags&CPU_CAP_SSE))
-        disable_denormals(&this->sse_state);
+        return disable_denormals();
 #endif
-
-    this->in_mode = true;
+    return 0u;
+#endif
 }
 
-void FPUCtl::leave() noexcept
+void FPUCtl::Reset(unsigned int state [[maybe_unused]]) noexcept
 {
-    if(!this->in_mode) return;
-
-#if defined(HAVE_SSE_INTRINSICS)
-    reset_fpu(this->sse_state);
-#elif defined(HAVE_SSE)
+#if HAVE_SSE_INTRINSICS
+    reset_fpu(state);
+#elif HAVE_SSE
     if((CPUCapFlags&CPU_CAP_SSE))
-        reset_fpu(this->sse_state);
+        reset_fpu(state);
 #endif
-    this->in_mode = false;
 }

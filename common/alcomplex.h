@@ -2,34 +2,30 @@
 #define ALCOMPLEX_H
 
 #include <complex>
-#include <type_traits>
+#include <span>
 
-#include "alspan.h"
+#include "alnumeric.h"
 
 /**
  * Iterative implementation of 2-radix FFT (In-place algorithm). Sign = -1 is
  * FFT and 1 is inverse FFT. Applies the Discrete Fourier Transform (DFT) to
  * the data supplied in the buffer, which MUST BE power of two.
  */
-template<typename Real>
-std::enable_if_t<std::is_floating_point<Real>::value>
-complex_fft(const al::span<std::complex<Real>> buffer, const al::type_identity_t<Real> sign);
+void complex_fft(std::span<std::complex<f64>> buffer, f64 sign);
 
 /**
  * Calculate the frequency-domain response of the time-domain signal in the
  * provided buffer, which MUST BE power of two.
  */
-template<typename T, size_t N>
-void forward_fft(const al::span<T,N> buffer)
-{ complex_fft(al::span<T>{buffer}, -1); }
+inline void forward_fft(std::span<std::complex<f64>> const buffer)
+{ complex_fft(buffer, -1.0); }
 
 /**
  * Calculate the time-domain signal of the frequency-domain response in the
  * provided buffer, which MUST BE power of two.
  */
-template<typename T, size_t N>
-void inverse_fft(const al::span<T,N> buffer)
-{ complex_fft(al::span<T>{buffer}, 1); }
+inline void inverse_fft(std::span<std::complex<f64>> const buffer)
+{ complex_fft(buffer, +1.0); }
 
 /**
  * Calculate the complex helical sequence (discrete-time analytical signal) of
@@ -38,6 +34,6 @@ void inverse_fft(const al::span<T,N> buffer)
  * buffer. The buffer is an array of complex numbers and MUST BE power of two,
  * and the imaginary components should be cleared to 0.
  */
-void complex_hilbert(const al::span<std::complex<double>> buffer);
+void complex_hilbert(std::span<std::complex<f64>> buffer);
 
 #endif /* ALCOMPLEX_H */

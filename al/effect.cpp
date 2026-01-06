@@ -23,26 +23,29 @@
 #include "effect.h"
 
 #include <algorithm>
-#include <cstdint>
+#include <bit>
 #include <cstring>
 #include <iterator>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <numeric>
+#include <span>
+#include <string_view>
+#include <type_traits>
+#include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "AL/al.h"
-#include "AL/alc.h"
 #include "AL/alext.h"
 #include "AL/efx-presets.h"
 #include "AL/efx.h"
 
-#include "albit.h"
+#include "al/effects/effects.h"
 #include "alc/context.h"
 #include "alc/device.h"
-#include "alc/effects/base.h"
 #include "alc/inprogext.h"
 #include "almalloc.h"
 #include "alnumeric.h"
@@ -50,15 +53,13 @@
 #include "core/except.h"
 #include "core/logging.h"
 #include "direct_defs.h"
+#include "gsl/gsl"
 #include "opthelpers.h"
 
-#ifdef ALSOFT_EAX
-#include <cassert>
+using uint = unsigned int;
 
-#include "eax/exception.h"
-#endif // ALSOFT_EAX
 
-const EffectList gEffectList[16]{
+constinit const std::array<EffectList,16> gEffectList{{
     { "eaxreverb",   EAXREVERB_EFFECT,   AL_EFFECT_EAXREVERB },
     { "reverb",      REVERB_EFFECT,      AL_EFFECT_REVERB },
     { "autowah",     AUTOWAH_EFFECT,     AL_EFFECT_AUTOWAH },
@@ -74,481 +75,472 @@ const EffectList gEffectList[16]{
     { "vmorpher",    VMORPHER_EFFECT,    AL_EFFECT_VOCAL_MORPHER },
     { "dedicated",   DEDICATED_EFFECT,   AL_EFFECT_DEDICATED_LOW_FREQUENCY_EFFECT },
     { "dedicated",   DEDICATED_EFFECT,   AL_EFFECT_DEDICATED_DIALOGUE },
-    { "convolution", CONVOLUTION_EFFECT, AL_EFFECT_CONVOLUTION_REVERB_SOFT },
-};
+    { "convolution", CONVOLUTION_EFFECT, AL_EFFECT_CONVOLUTION_SOFT },
+}};
 
-bool DisabledEffects[MAX_EFFECTS];
-
-
-effect_exception::effect_exception(ALenum code, const char *msg, ...) : mErrorCode{code}
-{
-    std::va_list args;
-    va_start(args, msg);
-    setMessage(msg, args);
-    va_end(args);
-}
-effect_exception::~effect_exception() = default;
 
 namespace {
 
-struct EffectPropsItem {
-    ALenum Type;
-    const EffectProps &DefaultProps;
-    const EffectVtable &Vtable;
-};
-constexpr EffectPropsItem EffectPropsList[] = {
-    { AL_EFFECT_NULL, NullEffectProps, NullEffectVtable },
-    { AL_EFFECT_EAXREVERB, ReverbEffectProps, ReverbEffectVtable },
-    { AL_EFFECT_REVERB, StdReverbEffectProps, StdReverbEffectVtable },
-    { AL_EFFECT_AUTOWAH, AutowahEffectProps, AutowahEffectVtable },
-    { AL_EFFECT_CHORUS, ChorusEffectProps, ChorusEffectVtable },
-    { AL_EFFECT_COMPRESSOR, CompressorEffectProps, CompressorEffectVtable },
-    { AL_EFFECT_DISTORTION, DistortionEffectProps, DistortionEffectVtable },
-    { AL_EFFECT_ECHO, EchoEffectProps, EchoEffectVtable },
-    { AL_EFFECT_EQUALIZER, EqualizerEffectProps, EqualizerEffectVtable },
-    { AL_EFFECT_FLANGER, FlangerEffectProps, FlangerEffectVtable },
-    { AL_EFFECT_FREQUENCY_SHIFTER, FshifterEffectProps, FshifterEffectVtable },
-    { AL_EFFECT_RING_MODULATOR, ModulatorEffectProps, ModulatorEffectVtable },
-    { AL_EFFECT_PITCH_SHIFTER, PshifterEffectProps, PshifterEffectVtable },
-    { AL_EFFECT_VOCAL_MORPHER, VmorpherEffectProps, VmorpherEffectVtable },
-    { AL_EFFECT_DEDICATED_DIALOGUE, DedicatedEffectProps, DedicatedEffectVtable },
-    { AL_EFFECT_DEDICATED_LOW_FREQUENCY_EFFECT, DedicatedEffectProps, DedicatedEffectVtable },
-    { AL_EFFECT_CONVOLUTION_REVERB_SOFT, ConvolutionEffectProps, ConvolutionEffectVtable },
-};
+using namespace std::string_view_literals;
 
+using SubListAllocator = al::allocator<std::array<al::Effect,64>>;
 
-void ALeffect_setParami(ALeffect *effect, ALenum param, int value)
-{ effect->vtab->setParami(&effect->Props, param, value); }
-void ALeffect_setParamiv(ALeffect *effect, ALenum param, const int *values)
-{ effect->vtab->setParamiv(&effect->Props, param, values); }
-void ALeffect_setParamf(ALeffect *effect, ALenum param, float value)
-{ effect->vtab->setParamf(&effect->Props, param, value); }
-void ALeffect_setParamfv(ALeffect *effect, ALenum param, const float *values)
-{ effect->vtab->setParamfv(&effect->Props, param, values); }
-
-void ALeffect_getParami(const ALeffect *effect, ALenum param, int *value)
-{ effect->vtab->getParami(&effect->Props, param, value); }
-void ALeffect_getParamiv(const ALeffect *effect, ALenum param, int *values)
-{ effect->vtab->getParamiv(&effect->Props, param, values); }
-void ALeffect_getParamf(const ALeffect *effect, ALenum param, float *value)
-{ effect->vtab->getParamf(&effect->Props, param, value); }
-void ALeffect_getParamfv(const ALeffect *effect, ALenum param, float *values)
-{ effect->vtab->getParamfv(&effect->Props, param, values); }
-
-
-const EffectPropsItem *getEffectPropsItemByType(ALenum type)
+constexpr auto GetDefaultProps(ALenum const type) noexcept -> const EffectProps&
 {
-    auto iter = std::find_if(std::begin(EffectPropsList), std::end(EffectPropsList),
-        [type](const EffectPropsItem &item) noexcept -> bool
-        { return item.Type == type; });
-    return (iter != std::end(EffectPropsList)) ? al::to_address(iter) : nullptr;
+    switch(type)
+    {
+    case AL_EFFECT_NULL: return NullEffectProps;
+    case AL_EFFECT_EAXREVERB: return ReverbEffectProps;
+    case AL_EFFECT_REVERB: return StdReverbEffectProps;
+    case AL_EFFECT_AUTOWAH: return AutowahEffectProps;
+    case AL_EFFECT_CHORUS: return ChorusEffectProps;
+    case AL_EFFECT_COMPRESSOR: return CompressorEffectProps;
+    case AL_EFFECT_DISTORTION: return DistortionEffectProps;
+    case AL_EFFECT_ECHO: return EchoEffectProps;
+    case AL_EFFECT_EQUALIZER: return EqualizerEffectProps;
+    case AL_EFFECT_FLANGER: return FlangerEffectProps;
+    case AL_EFFECT_FREQUENCY_SHIFTER: return FshifterEffectProps;
+    case AL_EFFECT_RING_MODULATOR: return ModulatorEffectProps;
+    case AL_EFFECT_PITCH_SHIFTER: return PshifterEffectProps;
+    case AL_EFFECT_VOCAL_MORPHER: return VmorpherEffectProps;
+    case AL_EFFECT_DEDICATED_DIALOGUE: return DedicatedDialogEffectProps;
+    case AL_EFFECT_DEDICATED_LOW_FREQUENCY_EFFECT: return DedicatedLfeEffectProps;
+    case AL_EFFECT_CONVOLUTION_SOFT: return ConvolutionEffectProps;
+    }
+    return NullEffectProps;
 }
 
-void InitEffectParams(ALeffect *effect, ALenum type)
+void InitEffectParams(al::Effect *const effect, ALenum const type) noexcept
 {
-    const EffectPropsItem *item{getEffectPropsItemByType(type)};
-    if(item)
+    switch(type)
     {
-        effect->Props = item->DefaultProps;
-        effect->vtab = &item->Vtable;
+    case AL_EFFECT_NULL: effect->mPropsVariant.emplace<NullEffectHandler>(); break;
+    case AL_EFFECT_EAXREVERB: effect->mPropsVariant.emplace<ReverbEffectHandler>(); break;
+    case AL_EFFECT_REVERB: effect->mPropsVariant.emplace<StdReverbEffectHandler>(); break;
+    case AL_EFFECT_AUTOWAH: effect->mPropsVariant.emplace<AutowahEffectHandler>(); break;
+    case AL_EFFECT_CHORUS: effect->mPropsVariant.emplace<ChorusEffectHandler>(); break;
+    case AL_EFFECT_COMPRESSOR: effect->mPropsVariant.emplace<CompressorEffectHandler>(); break;
+    case AL_EFFECT_DISTORTION: effect->mPropsVariant.emplace<DistortionEffectHandler>(); break;
+    case AL_EFFECT_ECHO: effect->mPropsVariant.emplace<EchoEffectHandler>(); break;
+    case AL_EFFECT_EQUALIZER: effect->mPropsVariant.emplace<EqualizerEffectHandler>(); break;
+    case AL_EFFECT_FLANGER: effect->mPropsVariant.emplace<ChorusEffectHandler>(); break;
+    case AL_EFFECT_FREQUENCY_SHIFTER: effect->mPropsVariant.emplace<FshifterEffectHandler>(); break;
+    case AL_EFFECT_RING_MODULATOR: effect->mPropsVariant.emplace<ModulatorEffectHandler>(); break;
+    case AL_EFFECT_PITCH_SHIFTER: effect->mPropsVariant.emplace<PshifterEffectHandler>(); break;
+    case AL_EFFECT_VOCAL_MORPHER: effect->mPropsVariant.emplace<VmorpherEffectHandler>(); break;
+    case AL_EFFECT_DEDICATED_DIALOGUE:
+        effect->mPropsVariant.emplace<DedicatedDialogEffectHandler>();
+        break;
+    case AL_EFFECT_DEDICATED_LOW_FREQUENCY_EFFECT:
+        effect->mPropsVariant.emplace<DedicatedLfeEffectHandler>();
+        break;
+    case AL_EFFECT_CONVOLUTION_SOFT:
+        effect->mPropsVariant.emplace<ConvolutionEffectHandler>();
+        break;
     }
-    else
-    {
-        effect->Props = EffectProps{};
-        effect->vtab = &NullEffectVtable;
-    }
-    effect->type = type;
+    effect->mProps = GetDefaultProps(type);
+    effect->mType = type;
 }
 
-bool EnsureEffects(ALCdevice *device, size_t needed)
-{
-    size_t count{std::accumulate(device->EffectList.cbegin(), device->EffectList.cend(), 0_uz,
-        [](size_t cur, const EffectSubList &sublist) noexcept -> size_t
-        { return cur + static_cast<ALuint>(al::popcount(sublist.FreeMask)); })};
+[[nodiscard]]
+auto EnsureEffects(gsl::not_null<al::Device*> const device, usize const needed) noexcept -> bool
+try {
+    auto count = std::accumulate(device->EffectList.cbegin(), device->EffectList.cend(), 0_uz,
+        [](usize const cur, const EffectSubList &sublist) noexcept -> usize
+        { return cur + gsl::narrow_cast<uint>(std::popcount(sublist.mFreeMask)); });
 
     while(needed > count)
     {
-        if(device->EffectList.size() >= 1<<25) UNLIKELY
+        if(device->EffectList.size() >= 1<<25) [[unlikely]]
             return false;
 
-        device->EffectList.emplace_back();
-        auto sublist = device->EffectList.end() - 1;
-        sublist->FreeMask = ~0_u64;
-        sublist->Effects = static_cast<ALeffect*>(al_calloc(alignof(ALeffect), sizeof(ALeffect)*64));
-        if(!sublist->Effects) UNLIKELY
-        {
-            device->EffectList.pop_back();
-            return false;
-        }
-        count += 64;
+        auto sublist = EffectSubList{};
+        sublist.mFreeMask = ~0_u64;
+        sublist.mEffects = SubListAllocator{}.allocate(1);
+        device->EffectList.emplace_back(std::move(sublist));
+        count += std::tuple_size_v<SubListAllocator::value_type>;
     }
     return true;
 }
+catch(...) {
+    return false;
+}
 
-ALeffect *AllocEffect(ALCdevice *device)
+[[nodiscard]]
+auto AllocEffect(gsl::not_null<al::Device*> const device) noexcept -> gsl::not_null<al::Effect*>
 {
-    auto sublist = std::find_if(device->EffectList.begin(), device->EffectList.end(),
-        [](const EffectSubList &entry) noexcept -> bool
-        { return entry.FreeMask != 0; });
-    auto lidx = static_cast<ALuint>(std::distance(device->EffectList.begin(), sublist));
-    auto slidx = static_cast<ALuint>(al::countr_zero(sublist->FreeMask));
+    auto const sublist = std::ranges::find_if(device->EffectList, &EffectSubList::mFreeMask);
+    auto const lidx = gsl::narrow_cast<u32>(std::distance(device->EffectList.begin(), sublist));
+    auto const slidx = gsl::narrow_cast<u32>(std::countr_zero(sublist->mFreeMask));
     ASSUME(slidx < 64);
 
-    ALeffect *effect{al::construct_at(sublist->Effects + slidx)};
+    auto effect = gsl::make_not_null(std::construct_at(
+        std::to_address(std::next(sublist->mEffects->begin(), slidx))));
     InitEffectParams(effect, AL_EFFECT_NULL);
 
     /* Add 1 to avoid effect ID 0. */
-    effect->id = ((lidx<<6) | slidx) + 1;
+    effect->mId = ((lidx<<6) | slidx) + 1;
 
-    sublist->FreeMask &= ~(1_u64 << slidx);
+    sublist->mFreeMask &= ~(1_u64 << slidx);
 
     return effect;
 }
 
-void FreeEffect(ALCdevice *device, ALeffect *effect)
+void FreeEffect(gsl::not_null<al::Device*> const device, gsl::not_null<al::Effect*> const effect)
 {
-    device->mEffectNames.erase(effect->id);
+    device->mEffectNames.erase(effect->mId);
 
-    const ALuint id{effect->id - 1};
-    const size_t lidx{id >> 6};
-    const ALuint slidx{id & 0x3f};
+    const auto id = effect->mId - 1;
+    const auto lidx = id >> 6;
+    const auto slidx = id & 0x3f;
 
-    std::destroy_at(effect);
+    std::destroy_at(std::to_address(effect));
 
-    device->EffectList[lidx].FreeMask |= 1_u64 << slidx;
+    device->EffectList[lidx].mFreeMask |= 1_u64 << slidx;
 }
 
-inline ALeffect *LookupEffect(ALCdevice *device, ALuint id)
+[[nodiscard]]
+auto LookupEffect(std::nothrow_t, gsl::not_null<al::Device*> const device, u32 const id) noexcept
+    -> al::Effect*
 {
-    const size_t lidx{(id-1) >> 6};
-    const ALuint slidx{(id-1) & 0x3f};
+    const auto lidx = (id-1) >> 6;
+    const auto slidx = (id-1) & 0x3f;
 
-    if(lidx >= device->EffectList.size()) UNLIKELY
+    if(lidx >= device->EffectList.size()) [[unlikely]]
         return nullptr;
-    EffectSubList &sublist = device->EffectList[lidx];
-    if(sublist.FreeMask & (1_u64 << slidx)) UNLIKELY
+    auto &sublist = device->EffectList[lidx];
+    if(sublist.mFreeMask & (1_u64 << slidx)) [[unlikely]]
         return nullptr;
-    return sublist.Effects + slidx;
+    return std::to_address(std::next(sublist.mEffects->begin(), slidx));
 }
 
-} // namespace
-
-AL_API DECL_FUNC2(void, alGenEffects, ALsizei, ALuint*)
-FORCE_ALIGN void AL_APIENTRY alGenEffectsDirect(ALCcontext *context, ALsizei n, ALuint *effects) noexcept
+[[nodiscard]]
+auto LookupEffect(gsl::not_null<al::Context*> const context, u32 const id)
+    -> gsl::not_null<al::Effect*>
 {
-    if(n < 0) UNLIKELY
-        context->setError(AL_INVALID_VALUE, "Generating %d effects", n);
-    if(n <= 0) UNLIKELY return;
-
-    ALCdevice *device{context->mALDevice.get()};
-    std::lock_guard<std::mutex> _{device->EffectLock};
-    if(!EnsureEffects(device, static_cast<ALuint>(n)))
-    {
-        context->setError(AL_OUT_OF_MEMORY, "Failed to allocate %d effect%s", n, (n==1)?"":"s");
-        return;
-    }
-
-    if(n == 1) LIKELY
-    {
-        /* Special handling for the easy and normal case. */
-        ALeffect *effect{AllocEffect(device)};
-        effects[0] = effect->id;
-    }
-    else
-    {
-        /* Store the allocated buffer IDs in a separate local list, to avoid
-         * modifying the user storage in case of failure.
-         */
-        std::vector<ALuint> ids;
-        ids.reserve(static_cast<ALuint>(n));
-        do {
-            ALeffect *effect{AllocEffect(device)};
-            ids.emplace_back(effect->id);
-        } while(--n);
-        std::copy(ids.cbegin(), ids.cend(), effects);
-    }
+    if(auto *const effect = LookupEffect(std::nothrow, al::get_not_null(context->mALDevice), id))
+        [[likely]] return gsl::make_not_null(effect);
+    context->throw_error(AL_INVALID_NAME, "Invalid effect ID {}", id);
 }
 
-AL_API DECL_FUNC2(void, alDeleteEffects, ALsizei, const ALuint*)
-FORCE_ALIGN void AL_APIENTRY alDeleteEffectsDirect(ALCcontext *context, ALsizei n,
-    const ALuint *effects) noexcept
-{
-    if(n < 0) UNLIKELY
-        context->setError(AL_INVALID_VALUE, "Deleting %d effects", n);
-    if(n <= 0) UNLIKELY return;
 
-    ALCdevice *device{context->mALDevice.get()};
-    std::lock_guard<std::mutex> _{device->EffectLock};
+void alGenEffects(gsl::not_null<al::Context*> context, ALsizei n, ALuint *effects) noexcept
+try {
+    if(n < 0)
+        context->throw_error(AL_INVALID_VALUE, "Generating {} effects", n);
+    if(n <= 0) [[unlikely]] return;
+
+    auto const device = al::get_not_null(context->mALDevice);
+    auto effectlock = std::lock_guard{device->EffectLock};
+
+    const auto eids = std::views::counted(effects, n);
+    if(!EnsureEffects(device, eids.size()))
+        context->throw_error(AL_OUT_OF_MEMORY, "Failed to allocate {} effect{}", n,
+            (n==1) ? "" : "s");
+
+    std::ranges::generate(eids, [device]{ return AllocEffect(device)->mId; });
+}
+catch(al::base_exception&) {
+}
+catch(std::exception &e) {
+    ERR("Caught exception: {}", e.what());
+}
+
+void alDeleteEffects(gsl::not_null<al::Context*> context, ALsizei n, const ALuint *effects)
+    noexcept
+try {
+    if(n < 0)
+        context->throw_error(AL_INVALID_VALUE, "Deleting {} effects", n);
+    if(n <= 0) [[unlikely]] return;
+
+    auto const device = al::get_not_null(context->mALDevice);
+    auto effectlock = std::lock_guard{device->EffectLock};
 
     /* First try to find any effects that are invalid. */
-    auto validate_effect = [device](const ALuint eid) -> bool
-    { return !eid || LookupEffect(device, eid) != nullptr; };
-
-    const ALuint *effects_end = effects + n;
-    auto inveffect = std::find_if_not(effects, effects_end, validate_effect);
-    if(inveffect != effects_end) UNLIKELY
-    {
-        context->setError(AL_INVALID_NAME, "Invalid effect ID %u", *inveffect);
-        return;
-    }
+    const auto eids = std::views::counted(effects, n);
+    std::ranges::for_each(eids, [context](const ALuint eid)
+    { if(eid != 0) std::ignore = LookupEffect(context, eid); });
 
     /* All good. Delete non-0 effect IDs. */
-    auto delete_effect = [device](ALuint eid) -> void
+    std::ranges::for_each(eids, [device](ALuint eid)
     {
-        ALeffect *effect{eid ? LookupEffect(device, eid) : nullptr};
-        if(effect) FreeEffect(device, effect);
-    };
-    std::for_each(effects, effects_end, delete_effect);
+        if(auto *effect = LookupEffect(std::nothrow, device, eid))
+            FreeEffect(device, gsl::make_not_null(effect));
+    });
+}
+catch(al::base_exception&) {
+}
+catch(std::exception &e) {
+    ERR("Caught exception: {}", e.what());
 }
 
-AL_API DECL_FUNC1(ALboolean, alIsEffect, ALuint)
-FORCE_ALIGN ALboolean AL_APIENTRY alIsEffectDirect(ALCcontext *context, ALuint effect) noexcept
+auto alIsEffect(gsl::not_null<al::Context*> context, ALuint effect) noexcept -> ALboolean
 {
-    ALCdevice *device{context->mALDevice.get()};
-    std::lock_guard<std::mutex> _{device->EffectLock};
-    if(!effect || LookupEffect(device, effect))
+    auto const device = al::get_not_null(context->mALDevice);
+    auto effectlock = std::lock_guard{device->EffectLock};
+    if(effect == 0 || LookupEffect(std::nothrow, device, effect) != nullptr)
         return AL_TRUE;
     return AL_FALSE;
 }
 
-AL_API DECL_FUNC3(void, alEffecti, ALuint, ALenum, ALint)
-FORCE_ALIGN void AL_APIENTRY alEffectiDirect(ALCcontext *context, ALuint effect, ALenum param,
-    ALint value) noexcept
-{
-    ALCdevice *device{context->mALDevice.get()};
-    std::lock_guard<std::mutex> _{device->EffectLock};
 
-    ALeffect *aleffect{LookupEffect(device, effect)};
-    if(!aleffect) UNLIKELY
-        context->setError(AL_INVALID_NAME, "Invalid effect ID %u", effect);
-    else if(param == AL_EFFECT_TYPE)
+void alEffecti(gsl::not_null<al::Context*> context, ALuint effect, ALenum param, ALint value)
+    noexcept
+try {
+    auto const device = al::get_not_null(context->mALDevice);
+    auto effectlock = std::lock_guard{device->EffectLock};
+
+    auto const aleffect = LookupEffect(context, effect);
+    switch(param)
     {
-        bool isOk{value == AL_EFFECT_NULL};
-        if(!isOk)
+    case AL_EFFECT_TYPE:
+        if(value != AL_EFFECT_NULL)
         {
-            for(const EffectList &effectitem : gEffectList)
-            {
-                if(value == effectitem.val && !DisabledEffects[effectitem.type])
-                {
-                    isOk = true;
-                    break;
-                }
-            }
+            auto check_effect = [value](const EffectList &item) -> bool
+            { return value == item.val && !DisabledEffects.test(item.type); };
+            if(!std::ranges::any_of(gEffectList, check_effect))
+                context->throw_error(AL_INVALID_VALUE, "Effect type {:#04x} not supported",
+                    as_unsigned(value));
         }
 
-        if(isOk)
-            InitEffectParams(aleffect, value);
-        else
-            context->setError(AL_INVALID_VALUE, "Effect type 0x%04x not supported", value);
+        InitEffectParams(aleffect, value);
+        return;
     }
-    else try
+
+    /* Call the appropriate handler */
+    std::visit([context,aleffect,param,value]<typename T>(T &arg)
     {
-        /* Call the appropriate handler */
-        ALeffect_setParami(aleffect, param, value);
-    }
-    catch(effect_exception &e) {
-        context->setError(e.errorCode(), "%s", e.what());
-    }
+        using PropType = T::prop_type;
+        return arg.SetParami(context, std::get<PropType>(aleffect->mProps), param, value);
+    }, aleffect->mPropsVariant);
+}
+catch(al::base_exception&) {
+}
+catch(std::exception &e) {
+    ERR("Caught exception: {}", e.what());
 }
 
-AL_API DECL_FUNC3(void, alEffectiv, ALuint, ALenum, const ALint*)
-FORCE_ALIGN void AL_APIENTRY alEffectivDirect(ALCcontext *context, ALuint effect, ALenum param,
+void alEffectiv(gsl::not_null<al::Context*> context, ALuint effect, ALenum param,
     const ALint *values) noexcept
-{
+try {
     switch(param)
     {
     case AL_EFFECT_TYPE:
-        alEffectiDirect(context, effect, param, values[0]);
+        alEffecti(context, effect, param, *values);
         return;
     }
 
-    ALCdevice *device{context->mALDevice.get()};
-    std::lock_guard<std::mutex> _{device->EffectLock};
+    auto const device = al::get_not_null(context->mALDevice);
+    auto effectlock = std::lock_guard{device->EffectLock};
 
-    ALeffect *aleffect{LookupEffect(device, effect)};
-    if(!aleffect) UNLIKELY
-        context->setError(AL_INVALID_NAME, "Invalid effect ID %u", effect);
-    else try
+    auto const aleffect = LookupEffect(context, effect);
+
+    /* Call the appropriate handler */
+    std::visit([context,aleffect,param,values]<typename T>(T &arg)
     {
-        /* Call the appropriate handler */
-        ALeffect_setParamiv(aleffect, param, values);
-    }
-    catch(effect_exception &e) {
-        context->setError(e.errorCode(), "%s", e.what());
-    }
+        using PropType = T::prop_type;
+        return arg.SetParamiv(context, std::get<PropType>(aleffect->mProps), param, values);
+    }, aleffect->mPropsVariant);
+}
+catch(al::base_exception&) {
+}
+catch(std::exception &e) {
+    ERR("Caught exception: {}", e.what());
 }
 
-AL_API DECL_FUNC3(void, alEffectf, ALuint, ALenum, ALfloat)
-FORCE_ALIGN void AL_APIENTRY alEffectfDirect(ALCcontext *context, ALuint effect, ALenum param,
-    ALfloat value) noexcept
-{
-    ALCdevice *device{context->mALDevice.get()};
-    std::lock_guard<std::mutex> _{device->EffectLock};
+void alEffectf(gsl::not_null<al::Context*> context, ALuint effect, ALenum param, ALfloat value)
+    noexcept
+try {
+    auto const device = al::get_not_null(context->mALDevice);
+    auto effectlock = std::lock_guard{device->EffectLock};
 
-    ALeffect *aleffect{LookupEffect(device, effect)};
-    if(!aleffect) UNLIKELY
-        context->setError(AL_INVALID_NAME, "Invalid effect ID %u", effect);
-    else try
+    auto const aleffect = LookupEffect(context, effect);
+
+    /* Call the appropriate handler */
+    std::visit([context,aleffect,param,value]<typename T>(T &arg)
     {
-        /* Call the appropriate handler */
-        ALeffect_setParamf(aleffect, param, value);
-    }
-    catch(effect_exception &e) {
-        context->setError(e.errorCode(), "%s", e.what());
-    }
+        using PropType = T::prop_type;
+        return arg.SetParamf(context, std::get<PropType>(aleffect->mProps), param, value);
+    }, aleffect->mPropsVariant);
+}
+catch(al::base_exception&) {
+}
+catch(std::exception &e) {
+    ERR("Caught exception: {}", e.what());
 }
 
-AL_API DECL_FUNC3(void, alEffectfv, ALuint, ALenum, const ALfloat*)
-FORCE_ALIGN void AL_APIENTRY alEffectfvDirect(ALCcontext *context, ALuint effect, ALenum param,
+void alEffectfv(gsl::not_null<al::Context*> context, ALuint effect, ALenum param,
     const ALfloat *values) noexcept
-{
-    ALCdevice *device{context->mALDevice.get()};
-    std::lock_guard<std::mutex> _{device->EffectLock};
+try {
+    auto const device = al::get_not_null(context->mALDevice);
+    auto effectlock = std::lock_guard{device->EffectLock};
 
-    ALeffect *aleffect{LookupEffect(device, effect)};
-    if(!aleffect) UNLIKELY
-        context->setError(AL_INVALID_NAME, "Invalid effect ID %u", effect);
-    else try
+    auto const aleffect = LookupEffect(context, effect);
+
+    /* Call the appropriate handler */
+    std::visit([context,aleffect,param,values]<typename T>(T &arg)
     {
-        /* Call the appropriate handler */
-        ALeffect_setParamfv(aleffect, param, values);
-    }
-    catch(effect_exception &e) {
-        context->setError(e.errorCode(), "%s", e.what());
-    }
+        using PropType = T::prop_type;
+        return arg.SetParamfv(context, std::get<PropType>(aleffect->mProps), param, values);
+    }, aleffect->mPropsVariant);
+}
+catch(al::base_exception&) {
+}
+catch(std::exception &e) {
+    ERR("Caught exception: {}", e.what());
 }
 
-AL_API DECL_FUNC3(void, alGetEffecti, ALuint, ALenum, ALint*)
-FORCE_ALIGN void AL_APIENTRY alGetEffectiDirect(ALCcontext *context, ALuint effect, ALenum param,
-    ALint *value) noexcept
-{
-    ALCdevice *device{context->mALDevice.get()};
-    std::lock_guard<std::mutex> _{device->EffectLock};
+void alGetEffecti(gsl::not_null<al::Context*> context, ALuint effect, ALenum param, ALint *value)
+    noexcept
+try {
+    auto const device = al::get_not_null(context->mALDevice);
+    auto effectlock = std::lock_guard{device->EffectLock};
 
-    const ALeffect *aleffect{LookupEffect(device, effect)};
-    if(!aleffect) UNLIKELY
-        context->setError(AL_INVALID_NAME, "Invalid effect ID %u", effect);
-    else if(param == AL_EFFECT_TYPE)
-        *value = aleffect->type;
-    else try
+    auto const aleffect = LookupEffect(context, effect);
+    switch(param)
     {
-        /* Call the appropriate handler */
-        ALeffect_getParami(aleffect, param, value);
+    case AL_EFFECT_TYPE: *value = aleffect->mType; return;
     }
-    catch(effect_exception &e) {
-        context->setError(e.errorCode(), "%s", e.what());
-    }
+
+    /* Call the appropriate handler */
+    std::visit([context,aleffect,param,value]<typename T>(T &arg)
+    {
+        using PropType = T::prop_type;
+        return arg.GetParami(context, std::get<PropType>(aleffect->mProps), param, value);
+    }, aleffect->mPropsVariant);
+}
+catch(al::base_exception&) {
+}
+catch(std::exception &e) {
+    ERR("Caught exception: {}", e.what());
 }
 
-AL_API DECL_FUNC3(void, alGetEffectiv, ALuint, ALenum, ALint*)
-FORCE_ALIGN void AL_APIENTRY alGetEffectivDirect(ALCcontext *context, ALuint effect, ALenum param,
-    ALint *values) noexcept
-{
+void alGetEffectiv(gsl::not_null<al::Context*> context, ALuint effect, ALenum param, ALint *values)
+    noexcept
+try {
     switch(param)
     {
     case AL_EFFECT_TYPE:
-        alGetEffectiDirect(context, effect, param, values);
+        alGetEffecti(context, effect, param, values);
         return;
     }
 
-    ALCdevice *device{context->mALDevice.get()};
-    std::lock_guard<std::mutex> _{device->EffectLock};
+    auto const device = al::get_not_null(context->mALDevice);
+    auto effectlock = std::lock_guard{device->EffectLock};
 
-    const ALeffect *aleffect{LookupEffect(device, effect)};
-    if(!aleffect) UNLIKELY
-        context->setError(AL_INVALID_NAME, "Invalid effect ID %u", effect);
-    else try
+    auto const aleffect = LookupEffect(context, effect);
+
+    /* Call the appropriate handler */
+    std::visit([context,aleffect,param,values]<typename T>(T &arg)
     {
-        /* Call the appropriate handler */
-        ALeffect_getParamiv(aleffect, param, values);
-    }
-    catch(effect_exception &e) {
-        context->setError(e.errorCode(), "%s", e.what());
-    }
+        using PropType = T::prop_type;
+        return arg.GetParamiv(context, std::get<PropType>(aleffect->mProps), param, values);
+    }, aleffect->mPropsVariant);
+}
+catch(al::base_exception&) {
+}
+catch(std::exception &e) {
+    ERR("Caught exception: {}", e.what());
 }
 
-AL_API DECL_FUNC3(void, alGetEffectf, ALuint, ALenum, ALfloat*)
-FORCE_ALIGN void AL_APIENTRY alGetEffectfDirect(ALCcontext *context, ALuint effect, ALenum param,
-    ALfloat *value) noexcept
-{
-    ALCdevice *device{context->mALDevice.get()};
-    std::lock_guard<std::mutex> _{device->EffectLock};
+void alGetEffectf(gsl::not_null<al::Context*> context, ALuint effect, ALenum param, ALfloat *value)
+    noexcept
+try {
+    auto const device = al::get_not_null(context->mALDevice);
+    auto effectlock = std::lock_guard{device->EffectLock};
 
-    const ALeffect *aleffect{LookupEffect(device, effect)};
-    if(!aleffect) UNLIKELY
-        context->setError(AL_INVALID_NAME, "Invalid effect ID %u", effect);
-    else try
+    auto const aleffect = LookupEffect(context, effect);
+
+    /* Call the appropriate handler */
+    std::visit([context,aleffect,param,value]<typename T>(T &arg)
     {
-        /* Call the appropriate handler */
-        ALeffect_getParamf(aleffect, param, value);
-    }
-    catch(effect_exception &e) {
-        context->setError(e.errorCode(), "%s", e.what());
-    }
+        using PropType = T::prop_type;
+        return arg.GetParamf(context, std::get<PropType>(aleffect->mProps), param, value);
+    }, aleffect->mPropsVariant);
+}
+catch(al::base_exception&) {
+}
+catch(std::exception &e) {
+    ERR("Caught exception: {}", e.what());
 }
 
-AL_API DECL_FUNC3(void, alGetEffectfv, ALuint, ALenum, ALfloat*)
-FORCE_ALIGN void AL_APIENTRY alGetEffectfvDirect(ALCcontext *context, ALuint effect, ALenum param,
+void alGetEffectfv(gsl::not_null<al::Context*> context, ALuint effect, ALenum param,
     ALfloat *values) noexcept
-{
-    ALCdevice *device{context->mALDevice.get()};
-    std::lock_guard<std::mutex> _{device->EffectLock};
+try {
+    auto const device = al::get_not_null(context->mALDevice);
+    auto effectlock = std::lock_guard{device->EffectLock};
 
-    const ALeffect *aleffect{LookupEffect(device, effect)};
-    if(!aleffect) UNLIKELY
-        context->setError(AL_INVALID_NAME, "Invalid effect ID %u", effect);
-    else try
+    auto const aleffect = LookupEffect(context, effect);
+
+    /* Call the appropriate handler */
+    std::visit([context,aleffect,param,values]<typename T>(T &arg)
     {
-        /* Call the appropriate handler */
-        ALeffect_getParamfv(aleffect, param, values);
-    }
-    catch(effect_exception &e) {
-        context->setError(e.errorCode(), "%s", e.what());
-    }
+        using PropType = T::prop_type;
+        return arg.GetParamfv(context, std::get<PropType>(aleffect->mProps), param, values);
+    }, aleffect->mPropsVariant);
+}
+catch(al::base_exception&) {
+}
+catch(std::exception &e) {
+    ERR("Caught exception: {}", e.what());
 }
 
+} // namespace
 
-void InitEffect(ALeffect *effect)
+AL_API DECL_FUNC2(void, alGenEffects, ALsizei,n, ALuint*,effects)
+AL_API DECL_FUNC2(void, alDeleteEffects, ALsizei,n, const ALuint*,effects)
+AL_API DECL_FUNC1(ALboolean, alIsEffect, ALuint,effect)
+
+AL_API DECL_FUNC3(void, alEffecti, ALuint,effect, ALenum,param, ALint,value)
+AL_API DECL_FUNC3(void, alEffectiv, ALuint,effect, ALenum,param, const ALint*,values)
+AL_API DECL_FUNC3(void, alEffectf, ALuint,effect, ALenum,param, ALfloat,value)
+AL_API DECL_FUNC3(void, alEffectfv, ALuint,effect, ALenum,param, const ALfloat*,values)
+AL_API DECL_FUNC3(void, alGetEffecti, ALuint,effect, ALenum,param, ALint*,value)
+AL_API DECL_FUNC3(void, alGetEffectiv, ALuint,effect, ALenum,param, ALint*,values)
+AL_API DECL_FUNC3(void, alGetEffectf, ALuint,effect, ALenum,param, ALfloat*,value)
+AL_API DECL_FUNC3(void, alGetEffectfv, ALuint,effect, ALenum,param, ALfloat*,values)
+
+
+void InitEffect(al::Effect *const effect)
 {
     InitEffectParams(effect, AL_EFFECT_NULL);
 }
 
-void ALeffect::SetName(ALCcontext* context, ALuint id, std::string_view name)
+void al::Effect::SetName(gsl::not_null<Context*> const context, u32 const id,
+    std::string_view const name)
 {
-    ALCdevice *device{context->mALDevice.get()};
-    std::lock_guard<std::mutex> _{device->EffectLock};
+    auto const device = al::get_not_null(context->mALDevice);
+    auto const effectlock = std::lock_guard{device->EffectLock};
 
-    auto effect = LookupEffect(device, id);
-    if(!effect) UNLIKELY
-        return context->setError(AL_INVALID_NAME, "Invalid effect ID %u", id);
-
+    std::ignore = LookupEffect(context, id);
     device->mEffectNames.insert_or_assign(id, name);
 }
 
 
 EffectSubList::~EffectSubList()
 {
-    if(!Effects)
+    if(!mEffects)
         return;
 
-    uint64_t usemask{~FreeMask};
+    auto usemask = ~mFreeMask;
     while(usemask)
     {
-        const int idx{al::countr_zero(usemask)};
-        std::destroy_at(Effects+idx);
+        const auto idx = std::countr_zero(usemask);
+        std::destroy_at(std::to_address(std::next(mEffects->begin(), idx)));
         usemask &= ~(1_u64 << idx);
     }
-    FreeMask = ~usemask;
-    al_free(Effects);
-    Effects = nullptr;
+    mFreeMask = ~usemask;
+    SubListAllocator{}.deallocate(mEffects, 1);
+    mEffects = nullptr;
 }
 
 
-#define DECL(x) { #x, EFX_REVERB_PRESET_##x }
-static const struct {
-    const char name[32];
+struct EffectPreset {
+    std::string_view name;
     EFXEAXREVERBPROPERTIES props;
-} reverblist[] = {
+};
+#define DECL(x) EffectPreset{#x##sv, EFX_REVERB_PRESET_##x}
+static constexpr auto reverblist = std::array{
     DECL(GENERIC),
     DECL(PADDEDCELL),
     DECL(ROOM),
@@ -678,72 +670,71 @@ static const struct {
 };
 #undef DECL
 
-void LoadReverbPreset(const char *name, ALeffect *effect)
+void LoadReverbPreset(std::string_view const name, al::Effect *const effect)
 {
-    if(al::strcasecmp(name, "NONE") == 0)
+    if(al::case_compare(name, "NONE"sv) == 0)
     {
         InitEffectParams(effect, AL_EFFECT_NULL);
-        TRACE("Loading reverb '%s'\n", "NONE");
+        TRACE("Loading reverb '{}'", "NONE");
         return;
     }
 
-    if(!DisabledEffects[EAXREVERB_EFFECT])
+    if(!DisabledEffects.test(EAXREVERB_EFFECT))
         InitEffectParams(effect, AL_EFFECT_EAXREVERB);
-    else if(!DisabledEffects[REVERB_EFFECT])
+    else if(!DisabledEffects.test(REVERB_EFFECT))
         InitEffectParams(effect, AL_EFFECT_REVERB);
     else
-        InitEffectParams(effect, AL_EFFECT_NULL);
-    for(const auto &reverbitem : reverblist)
     {
-        const EFXEAXREVERBPROPERTIES *props;
-
-        if(al::strcasecmp(name, reverbitem.name) != 0)
-            continue;
-
-        TRACE("Loading reverb '%s'\n", reverbitem.name);
-        props = &reverbitem.props;
-        effect->Props.Reverb.Density   = props->flDensity;
-        effect->Props.Reverb.Diffusion = props->flDiffusion;
-        effect->Props.Reverb.Gain   = props->flGain;
-        effect->Props.Reverb.GainHF = props->flGainHF;
-        effect->Props.Reverb.GainLF = props->flGainLF;
-        effect->Props.Reverb.DecayTime    = props->flDecayTime;
-        effect->Props.Reverb.DecayHFRatio = props->flDecayHFRatio;
-        effect->Props.Reverb.DecayLFRatio = props->flDecayLFRatio;
-        effect->Props.Reverb.ReflectionsGain   = props->flReflectionsGain;
-        effect->Props.Reverb.ReflectionsDelay  = props->flReflectionsDelay;
-        effect->Props.Reverb.ReflectionsPan[0] = props->flReflectionsPan[0];
-        effect->Props.Reverb.ReflectionsPan[1] = props->flReflectionsPan[1];
-        effect->Props.Reverb.ReflectionsPan[2] = props->flReflectionsPan[2];
-        effect->Props.Reverb.LateReverbGain   = props->flLateReverbGain;
-        effect->Props.Reverb.LateReverbDelay  = props->flLateReverbDelay;
-        effect->Props.Reverb.LateReverbPan[0] = props->flLateReverbPan[0];
-        effect->Props.Reverb.LateReverbPan[1] = props->flLateReverbPan[1];
-        effect->Props.Reverb.LateReverbPan[2] = props->flLateReverbPan[2];
-        effect->Props.Reverb.EchoTime  = props->flEchoTime;
-        effect->Props.Reverb.EchoDepth = props->flEchoDepth;
-        effect->Props.Reverb.ModulationTime  = props->flModulationTime;
-        effect->Props.Reverb.ModulationDepth = props->flModulationDepth;
-        effect->Props.Reverb.AirAbsorptionGainHF = props->flAirAbsorptionGainHF;
-        effect->Props.Reverb.HFReference = props->flHFReference;
-        effect->Props.Reverb.LFReference = props->flLFReference;
-        effect->Props.Reverb.RoomRolloffFactor = props->flRoomRolloffFactor;
-        effect->Props.Reverb.DecayHFLimit = props->iDecayHFLimit ? AL_TRUE : AL_FALSE;
+        TRACE("Reverb disabled, ignoring preset '{}'", name);
+        InitEffectParams(effect, AL_EFFECT_NULL);
         return;
     }
 
-    WARN("Reverb preset '%s' not found\n", name);
+    const auto preset = std::ranges::find_if(reverblist, [name](EffectPreset const &item) -> bool
+    { return al::case_compare(name, item.name) == 0; });
+    if(preset == reverblist.end())
+    {
+        WARN("Reverb preset '{}' not found", name);
+        return;
+    }
+
+    TRACE("Loading reverb '{}'", preset->name);
+    const auto &props = preset->props;
+    auto &dst = std::get<ReverbProps>(effect->mProps);
+    dst.Density   = props.flDensity;
+    dst.Diffusion = props.flDiffusion;
+    dst.Gain   = props.flGain;
+    dst.GainHF = props.flGainHF;
+    dst.GainLF = props.flGainLF;
+    dst.DecayTime    = props.flDecayTime;
+    dst.DecayHFRatio = props.flDecayHFRatio;
+    dst.DecayLFRatio = props.flDecayLFRatio;
+    dst.ReflectionsGain   = props.flReflectionsGain;
+    dst.ReflectionsDelay  = props.flReflectionsDelay;
+    dst.ReflectionsPan[0] = props.flReflectionsPan[0];
+    dst.ReflectionsPan[1] = props.flReflectionsPan[1];
+    dst.ReflectionsPan[2] = props.flReflectionsPan[2];
+    dst.LateReverbGain   = props.flLateReverbGain;
+    dst.LateReverbDelay  = props.flLateReverbDelay;
+    dst.LateReverbPan[0] = props.flLateReverbPan[0];
+    dst.LateReverbPan[1] = props.flLateReverbPan[1];
+    dst.LateReverbPan[2] = props.flLateReverbPan[2];
+    dst.EchoTime  = props.flEchoTime;
+    dst.EchoDepth = props.flEchoDepth;
+    dst.ModulationTime  = props.flModulationTime;
+    dst.ModulationDepth = props.flModulationDepth;
+    dst.AirAbsorptionGainHF = props.flAirAbsorptionGainHF;
+    dst.HFReference = props.flHFReference;
+    dst.LFReference = props.flLFReference;
+    dst.RoomRolloffFactor = props.flRoomRolloffFactor;
+    dst.DecayHFLimit = props.iDecayHFLimit ? AL_TRUE : AL_FALSE;
 }
 
-bool IsValidEffectType(ALenum type) noexcept
+auto IsValidEffectType(ALenum const type) noexcept -> bool
 {
     if(type == AL_EFFECT_NULL)
         return true;
 
-    for(const auto &effect_item : gEffectList)
-    {
-        if(type == effect_item.val && !DisabledEffects[effect_item.type])
-            return true;
-    }
-    return false;
+    return std::ranges::any_of(gEffectList, [type](EffectList const &item) noexcept -> bool
+    { return type == item.val && !DisabledEffects.test(item.type); });
 }

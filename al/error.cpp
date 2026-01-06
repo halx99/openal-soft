@@ -21,19 +21,17 @@
 #include "config.h"
 
 #ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #endif
 
-#include <atomic>
 #include <csignal>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
-#include <mutex>
-#include <vector>
+#include <optional>
+#include <string>
+#include <utility>
 
 #include "AL/al.h"
 #include "AL/alc.h"
@@ -41,43 +39,34 @@
 #include "al/debug.h"
 #include "alc/alconfig.h"
 #include "alc/context.h"
-#include "almalloc.h"
-#include "alstring.h"
+#include "alformat.hpp"
+#include "alnumeric.h"
 #include "core/except.h"
 #include "core/logging.h"
 #include "direct_defs.h"
-#include "opthelpers.h"
-#include "strutils.h"
+#include "gsl/gsl"
+#include "strutils.hpp"
 
 
-bool TrapALError{false};
+namespace {
 
-void ALCcontext::setError(ALenum errorCode, const char *msg, ...)
+auto alGetError(gsl::not_null<al::Context*> context) noexcept -> ALenum
 {
-    auto message = std::vector<char>(256);
+    auto ret = context->mLastThreadError.get();
+    if(ret != AL_NO_ERROR) [[unlikely]]
+        context->mLastThreadError.set(AL_NO_ERROR);
+    return ret;
+}
 
-    va_list args, args2;
-    va_start(args, msg);
-    va_copy(args2, args);
-    int msglen{std::vsnprintf(message.data(), message.size(), msg, args)};
-    if(msglen >= 0 && static_cast<size_t>(msglen) >= message.size())
-    {
-        message.resize(static_cast<size_t>(msglen) + 1u);
-        msglen = std::vsnprintf(message.data(), message.size(), msg, args2);
-    }
-    va_end(args2);
-    va_end(args);
+} // namespace
 
-    if(msglen >= 0)
-        msg = message.data();
-    else
-    {
-        msg = "<internal error constructing message>";
-        msglen = static_cast<int>(strlen(msg));
-    }
 
-    WARN("Error generated on context %p, code 0x%04x, \"%s\"\n",
-        decltype(std::declval<void*>()){this}, errorCode, msg);
+void al::Context::setErrorImpl(ALenum const errorCode, al::string_view const fmt, al::format_args args)
+{
+    const auto message = al::vformat(fmt, std::move(args));
+
+    WARN("Error generated on context {}, code {:#04x}, \"{}\"",
+        decltype(std::declval<void*>()){this}, as_unsigned(errorCode), message);
     if(TrapALError)
     {
 #ifdef _WIN32
@@ -89,54 +78,63 @@ void ALCcontext::setError(ALenum errorCode, const char *msg, ...)
 #endif
     }
 
-    ALenum curerr{AL_NO_ERROR};
-    mLastError.compare_exchange_strong(curerr, errorCode);
+    if(mLastThreadError.get() == AL_NO_ERROR)
+        mLastThreadError.set(errorCode);
 
-    debugMessage(DebugSource::API, DebugType::Error, 0, DebugSeverity::High,
-        {msg, static_cast<uint>(msglen)});
+    debugMessage(DebugSource::API, DebugType::Error, as_unsigned(errorCode), DebugSeverity::High,
+        message);
 }
+
+void al::Context::throw_error_impl(ALenum const errorCode, al::string_view const fmt,
+    al::format_args args)
+{
+    setErrorImpl(errorCode, fmt, std::move(args));
+    throw al::base_exception{};
+}
+
 
 /* Special-case alGetError since it (potentially) raises a debug signal and
  * returns a non-default value for a null context.
  */
-AL_API ALenum AL_APIENTRY alGetError(void) noexcept
+AL_API auto AL_APIENTRY alGetError() noexcept -> ALenum
 {
-    auto context = GetContextRef();
-    if(!context) UNLIKELY
+    if(auto context = GetContextRef()) [[likely]]
+        return alGetError(gsl::make_not_null(context.get()));
+
+    static constexpr auto get_value = [](gsl::czstring envname, std::string_view optname) -> ALenum
     {
-        static const ALenum deferror{[](const char *envname, const char *optname) -> ALenum
+        auto optstr = al::getenv(envname);
+        if(!optstr)
+            optstr = ConfigValueStr({}, "game_compat", optname);
+        if(optstr)
         {
-            auto optstr = al::getenv(envname);
-            if(!optstr)
-                optstr = ConfigValueStr(nullptr, "game_compat", optname);
-
-            if(optstr)
-            {
-                char *end{};
-                auto value = std::strtoul(optstr->c_str(), &end, 0);
-                if(end && *end == '\0' && value <= std::numeric_limits<ALenum>::max())
-                    return static_cast<ALenum>(value);
-                ERR("Invalid default error value: \"%s\"", optstr->c_str());
+            try {
+                auto idx = 0_uz;
+                auto value = std::stoi(*optstr, &idx, 0);
+                if(idx >= optstr->size() || std::isspace(optstr->at(idx)))
+                    return value;
+            } catch(...) {
             }
-            return AL_INVALID_OPERATION;
-        }("__ALSOFT_DEFAULT_ERROR", "default-error")};
-
-        WARN("Querying error state on null context (implicitly 0x%04x)\n", deferror);
-        if(TrapALError)
-        {
-#ifdef _WIN32
-            if(IsDebuggerPresent())
-                DebugBreak();
-#elif defined(SIGTRAP)
-            raise(SIGTRAP);
-#endif
+            ERR("Invalid default error value: \"{}\"", *optstr);
         }
-        return deferror;
+        return AL_INVALID_OPERATION;
+    };
+    static const auto deferror = get_value("__ALSOFT_DEFAULT_ERROR", "default-error");
+
+    WARN("Querying error state on null context (implicitly {:#04x})", as_unsigned(deferror));
+    if(TrapALError)
+    {
+#ifdef _WIN32
+        if(IsDebuggerPresent())
+            DebugBreak();
+#elif defined(SIGTRAP)
+        raise(SIGTRAP);
+#endif
     }
-    return alGetErrorDirect(context.get());
+    return deferror;
 }
 
-FORCE_ALIGN ALenum AL_APIENTRY alGetErrorDirect(ALCcontext *context) noexcept
+FORCE_ALIGN auto AL_APIENTRY alGetErrorDirect(ALCcontext *context) noexcept -> ALenum
 {
-    return context->mLastError.exchange(AL_NO_ERROR);
+    return alGetError(al::verify_context(context));
 }

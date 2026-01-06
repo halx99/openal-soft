@@ -3,30 +3,35 @@
 
 #include <array>
 #include <cmath>
-#include <cstddef>
 #include <limits>
+#include <span>
 
-#include "alspan.h"
+#include "altypes.hpp"
+#include "opthelpers.h"
 
 
-namespace alu {
+namespace al {
 
-template<typename T>
-class VectorR {
-    static_assert(std::is_floating_point<T>::value, "Must use floating-point types");
-    alignas(16) T mVals[4];
+class Vector {
+    alignas(16) std::array<f32, 4> mVals{};
 
 public:
-    constexpr VectorR() noexcept = default;
-    constexpr VectorR(const VectorR&) noexcept = default;
-    constexpr explicit VectorR(T a, T b, T c, T d) noexcept : mVals{a, b, c, d} { }
+    constexpr Vector() noexcept = default;
+    constexpr Vector(const Vector&) noexcept = default;
+    constexpr Vector(Vector&&) noexcept = default;
+    constexpr explicit Vector(f32 const a, f32 const b, f32 const c, f32 const d) noexcept
+        : mVals{{a,b,c,d}}
+    { }
 
-    constexpr VectorR& operator=(const VectorR&) noexcept = default;
+    constexpr auto operator=(const Vector&) & noexcept LIFETIMEBOUND -> Vector& = default;
+    constexpr auto operator=(Vector&&) & noexcept LIFETIMEBOUND -> Vector& = default;
 
-    constexpr T& operator[](size_t idx) noexcept { return mVals[idx]; }
-    constexpr const T& operator[](size_t idx) const noexcept { return mVals[idx]; }
+    [[nodiscard]] constexpr
+    auto operator[](usize const idx) noexcept LIFETIMEBOUND -> f32& { return mVals[idx]; }
+    [[nodiscard]] constexpr
+    auto operator[](usize const idx) const noexcept LIFETIMEBOUND -> f32 const& { return mVals[idx]; }
 
-    constexpr VectorR& operator+=(const VectorR &rhs) noexcept
+    constexpr auto operator+=(const Vector &rhs) & noexcept -> Vector&
     {
         mVals[0] += rhs.mVals[0];
         mVals[1] += rhs.mVals[1];
@@ -35,86 +40,85 @@ public:
         return *this;
     }
 
-    constexpr VectorR operator-(const VectorR &rhs) const noexcept
+    [[nodiscard]] constexpr
+    auto operator-(const Vector &rhs) const noexcept -> Vector
     {
-        return VectorR{mVals[0] - rhs.mVals[0], mVals[1] - rhs.mVals[1],
+        return Vector{mVals[0] - rhs.mVals[0], mVals[1] - rhs.mVals[1],
             mVals[2] - rhs.mVals[2], mVals[3] - rhs.mVals[3]};
     }
 
-    constexpr T normalize(T limit = std::numeric_limits<T>::epsilon())
+    constexpr auto normalize() -> f32
     {
-        limit = std::max(limit, std::numeric_limits<T>::epsilon());
-        const T length_sqr{mVals[0]*mVals[0] + mVals[1]*mVals[1] + mVals[2]*mVals[2]};
-        if(length_sqr > limit*limit)
+        auto const length_sqr = f32{mVals[0]*mVals[0] + mVals[1]*mVals[1] + mVals[2]*mVals[2]};
+        if(length_sqr > std::numeric_limits<f32>::epsilon())
         {
-            const T length{std::sqrt(length_sqr)};
-            T inv_length{T{1}/length};
+            auto const length = std::sqrt(length_sqr);
+            auto const inv_length = 1.0f / length;
             mVals[0] *= inv_length;
             mVals[1] *= inv_length;
             mVals[2] *= inv_length;
             return length;
         }
-        mVals[0] = mVals[1] = mVals[2] = T{0};
-        return T{0};
+        mVals[0] = mVals[1] = mVals[2] = 0.0f;
+        return 0.0f;
     }
 
-    constexpr VectorR cross_product(const alu::VectorR<T> &rhs) const noexcept
+    [[nodiscard]] constexpr auto cross_product(const Vector &rhs) const noexcept -> Vector
     {
-        return VectorR{
+        return Vector{
             mVals[1]*rhs.mVals[2] - mVals[2]*rhs.mVals[1],
             mVals[2]*rhs.mVals[0] - mVals[0]*rhs.mVals[2],
             mVals[0]*rhs.mVals[1] - mVals[1]*rhs.mVals[0],
-            T{0}};
+            0.0f};
     }
 
-    constexpr T dot_product(const alu::VectorR<T> &rhs) const noexcept
+    [[nodiscard]] constexpr auto dot_product(const Vector &rhs) const noexcept -> f32
     { return mVals[0]*rhs.mVals[0] + mVals[1]*rhs.mVals[1] + mVals[2]*rhs.mVals[2]; }
 };
-using Vector = VectorR<float>;
 
-template<typename T>
-class MatrixR {
-    static_assert(std::is_floating_point<T>::value, "Must use floating-point types");
-    alignas(16) T mVals[16];
+class Matrix {
+    alignas(16) std::array<f32, 16> mVals{};
 
 public:
-    constexpr MatrixR() noexcept = default;
-    constexpr MatrixR(const MatrixR&) noexcept = default;
-    constexpr explicit MatrixR(
-        T aa, T ab, T ac, T ad,
-        T ba, T bb, T bc, T bd,
-        T ca, T cb, T cc, T cd,
-        T da, T db, T dc, T dd) noexcept
-        : mVals{aa,ab,ac,ad, ba,bb,bc,bd, ca,cb,cc,cd, da,db,dc,dd}
+    constexpr Matrix() noexcept = default;
+    constexpr Matrix(const Matrix&) noexcept = default;
+    constexpr Matrix(Matrix&&) noexcept = default;
+    constexpr explicit Matrix(
+        f32 const aa, f32 const ab, f32 const ac, f32 const ad,
+        f32 const ba, f32 const bb, f32 const bc, f32 const bd,
+        f32 const ca, f32 const cb, f32 const cc, f32 const cd,
+        f32 const da, f32 const db, f32 const dc, f32 const dd) noexcept
+        : mVals{{aa,ab,ac,ad, ba,bb,bc,bd, ca,cb,cc,cd, da,db,dc,dd}}
     { }
 
-    constexpr MatrixR& operator=(const MatrixR&) noexcept = default;
+    constexpr auto operator=(const Matrix&) & noexcept LIFETIMEBOUND -> Matrix& = default;
+    constexpr auto operator=(Matrix&&) & noexcept LIFETIMEBOUND -> Matrix& = default;
 
-    constexpr auto operator[](size_t idx) noexcept { return al::span<T,4>{&mVals[idx*4], 4}; }
-    constexpr auto operator[](size_t idx) const noexcept
-    { return al::span<const T,4>{&mVals[idx*4], 4}; }
+    [[nodiscard]] constexpr auto operator[](usize const idx) noexcept LIFETIMEBOUND
+    { return std::span<f32, 4>{&mVals[idx*4], 4}; }
+    [[nodiscard]] constexpr auto operator[](usize const idx) const noexcept LIFETIMEBOUND
+    { return std::span<f32 const, 4>{&mVals[idx*4], 4}; }
 
-    static constexpr MatrixR Identity() noexcept
+    [[nodiscard]] static constexpr auto Identity() noexcept -> Matrix
     {
-        return MatrixR{
-            T{1}, T{0}, T{0}, T{0},
-            T{0}, T{1}, T{0}, T{0},
-            T{0}, T{0}, T{1}, T{0},
-            T{0}, T{0}, T{0}, T{1}};
+        return Matrix{
+            1.0f, 0.0f, 0.0f, 0.0f,
+            0.0f, 1.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 1.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 1.0f};
+    }
+
+    [[nodiscard]] friend constexpr
+    auto operator*(const Matrix &mtx, const Vector &vec) noexcept -> Vector
+    {
+        return Vector{
+            vec[0]*mtx[0][0] + vec[1]*mtx[1][0] + vec[2]*mtx[2][0] + vec[3]*mtx[3][0],
+            vec[0]*mtx[0][1] + vec[1]*mtx[1][1] + vec[2]*mtx[2][1] + vec[3]*mtx[3][1],
+            vec[0]*mtx[0][2] + vec[1]*mtx[1][2] + vec[2]*mtx[2][2] + vec[3]*mtx[3][2],
+            vec[0]*mtx[0][3] + vec[1]*mtx[1][3] + vec[2]*mtx[2][3] + vec[3]*mtx[3][3]};
     }
 };
-using Matrix = MatrixR<float>;
 
-template<typename T>
-constexpr VectorR<T> operator*(const MatrixR<T> &mtx, const VectorR<T> &vec) noexcept
-{
-    return VectorR<T>{
-        vec[0]*mtx[0][0] + vec[1]*mtx[1][0] + vec[2]*mtx[2][0] + vec[3]*mtx[3][0],
-        vec[0]*mtx[0][1] + vec[1]*mtx[1][1] + vec[2]*mtx[2][1] + vec[3]*mtx[3][1],
-        vec[0]*mtx[0][2] + vec[1]*mtx[1][2] + vec[2]*mtx[2][2] + vec[3]*mtx[3][2],
-        vec[0]*mtx[0][3] + vec[1]*mtx[1][3] + vec[2]*mtx[2][3] + vec[3]*mtx[3][3]};
-}
-
-} // namespace alu
+} // namespace al
 
 #endif /* COMMON_VECMAT_H */

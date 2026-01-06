@@ -1,15 +1,15 @@
 #ifndef UTILS_SOFA_SUPPORT_H
 #define UTILS_SOFA_SUPPORT_H
 
-#include <cstddef>
 #include <memory>
+#include <span>
 #include <vector>
 
 #include "mysofa.h"
 
 
 struct MySofaDeleter {
-    void operator()(MYSOFA_HRTF *sofa) { mysofa_free(sofa); }
+    void operator()(MYSOFA_HRTF *sofa) const { mysofa_free(sofa); }
 };
 using MySofaHrtfPtr = std::unique_ptr<MYSOFA_HRTF,MySofaDeleter>;
 
@@ -25,6 +25,6 @@ struct SofaField {
 
 const char *SofaErrorStr(int err);
 
-std::vector<SofaField> GetCompatibleLayout(const size_t m, const float *xyzs);
+auto GetCompatibleLayout(std::span<const float> xyzs) -> std::vector<SofaField>;
 
 #endif /* UTILS_SOFA_SUPPORT_H */
